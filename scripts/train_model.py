@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import copy
 from torch_geometric.nn import SAGEConv, to_hetero
 from torch_geometric.data import HeteroData
 from torch_geometric.transforms import ToUndirected
@@ -11,7 +12,7 @@ import json
 import pandas as pd
 import numpy as np
 from tqdm.auto import tqdm
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 from infrastructure.repositories import PyGDataRepository
 from core.ai.gnn_architecture import LinkPredictionModel as ProjectLinkPredictionModel
 from config.settings import  PYG_DATA_PATH, OUTPUT_DIM, TRAINING_HISTORY_PATH, MODEL_PATH, \
@@ -206,16 +207,21 @@ def get_or_prepare_data():
     return data
 
 
-def loader_generator(data_source, target_edge_types, batch_size, shuffle=False):
+def loader_generator(data_source, target_edge_types, batch_size, shuffle=False, training=True):
     for et in target_edge_types:
         # 1. Kiểm tra nhanh (giữ nguyên logic cũ của bạn)
         if et not in data_source.edge_index_dict: pass
         if hasattr(data_source[et], 'edge_label_index') and data_source[et].edge_label_index.numel() == 0:
             continue
 
-        # 2. Chuẩn bị nhãn
+        # Train edges are positive-only; validation/test already contain positive and negative labels.
         lbl_index = data_source[et].edge_label_index
-        lbl_ones = torch.ones(lbl_index.size(1), dtype=torch.float32)
+        if training:
+            edge_label = torch.ones(lbl_index.size(1), dtype=torch.float32)
+            neg_sampling_ratio = 1.0
+        else:
+            edge_label = data_source[et].edge_label.float()
+            neg_sampling_ratio = 0.0
 
         # 3. Khởi tạo Loader (Chỉ tốn RAM tại thời điểm này)
 
@@ -223,8 +229,8 @@ def loader_generator(data_source, target_edge_types, batch_size, shuffle=False):
             data_source,
             num_neighbors=[15, 10],
             edge_label_index=(et, lbl_index),
-            edge_label=lbl_ones,
-            neg_sampling_ratio=1.0,
+            edge_label=edge_label,
+            neg_sampling_ratio=neg_sampling_ratio,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=0,        # Tăng lên 4 hoặc 6 (tùy số nhân CPU của bạn)
@@ -275,7 +281,7 @@ def train_epoch(model, data, optimizer, device, target_edge_types, scaler, batch
 
 
 @torch.no_grad()
-def evaluate(model, data, device, target_edge_types, batch_size=BATCH_SIZE):
+def evaluate_metrics(model, data, device, target_edge_types, batch_size=BATCH_SIZE):
     """
     Đánh giá mô hình trên tập Val hoặc Test.
 
@@ -286,7 +292,7 @@ def evaluate(model, data, device, target_edge_types, batch_size=BATCH_SIZE):
         target_edge_types: List các loại cạnh tương ứng với loaders.
 
     Returns:
-        score: Chỉ số ROC-AUC (0.0 -> 1.0).
+        ROC-AUC and Average Precision, or None when the split cannot be evaluated.
     """
     model.eval()  # Chuyển model sang chế độ đánh giá (tắt Dropout, khóa BatchNorm)
 
@@ -297,7 +303,9 @@ def evaluate(model, data, device, target_edge_types, batch_size=BATCH_SIZE):
     # Lưu ý: target_edge_types và loaders phải có cùng độ dài và thứ tự
     count = 1
     max = len(target_edge_types)
-    data_loader_gen = loader_generator(data, target_edge_types, batch_size, shuffle=False)
+    data_loader_gen = loader_generator(
+        data, target_edge_types, batch_size, shuffle=False, training=False
+    )
     for edge_type, loader in data_loader_gen:
 
         pbar = tqdm(loader, desc="Validation", leave=False)
@@ -330,33 +338,39 @@ def evaluate(model, data, device, target_edge_types, batch_size=BATCH_SIZE):
         del loader, pbar
     # 5. Xử lý trường hợp không có dữ liệu (tránh lỗi crash)
     if len(preds) == 0:
-        print("Not data for validation.")
-        return 0.0
+        print("No data for validation/test.")
+        return {"roc_auc": None, "average_precision": None}
 
     # 6. Gộp tất cả các mảng numpy lại thành 1 mảng dài duy nhất
     final_preds = np.concatenate(preds)
     final_labels = np.concatenate(ground_truths)
 
     if np.isnan(final_preds).any():
-        print("❌ LỖI NGHIÊM TRỌNG: Model output chứa NaN!")
-        return 0.0
+        print("Model output contains NaN.")
+        return {"roc_auc": None, "average_precision": None}
 
     # Kiểm tra xem Labels có đủ 2 lớp (0 và 1) không
     unique_labels = np.unique(final_labels)
     if len(unique_labels) < 2:
-        print(f"⚠️ CẢNH BÁO: Tập Label chỉ chứa 1 loại nhãn duy nhất: {unique_labels}")
-        print("-> Lý do: Loader Validation chưa bật 'neg_sampling_ratio'!")
-        return 0.0
+        print(f"Cannot calculate ROC-AUC: split contains only labels {unique_labels}.")
+        return {"roc_auc": None, "average_precision": None}
 
     # 7. Tính ROC-AUC Score
     try:
-        return roc_auc_score(final_labels, final_preds)
+        return {
+            "roc_auc": float(roc_auc_score(final_labels, final_preds)),
+            "average_precision": float(average_precision_score(final_labels, final_preds)),
+        }
     except ValueError as e:
-        print(f"❌ SKLEARN ERROR: {e}")
-        # In thêm thống kê để biết tại sao
+        print(f"SKLEARN ERROR: {e}")
         print(f"Min Pred: {final_preds.min()}, Max Pred: {final_preds.max()}")
         print(f"Unique Labels: {np.unique(final_labels)}")
-        return 0.0
+        return {"roc_auc": None, "average_precision": None}
+
+
+def evaluate(model, data, device, target_edge_types, batch_size=BATCH_SIZE):
+    """Backward-compatible ROC-AUC-only evaluator."""
+    return evaluate_metrics(model, data, device, target_edge_types, batch_size)["roc_auc"] or 0.0
 
 
 # --- 3. CHIẾN LƯỢC CHẠY ---
@@ -448,8 +462,8 @@ def train_one_config(split_data, config, device, final_mode=False, trial=None):
 
     early_stop_patience = 10
     early_stop_counter = 0
-    history = {"epoch": [], "loss": [], "val_auc": []}
-    best_val_auc = 0.0
+    history = {"epoch": [], "loss": [], "val_auc": [], "val_ap": []}
+    best_val_auc = -1.0
     final_test_auc = 0.0
     best_model_state = None
     best_epoch_found = 0
@@ -465,19 +479,23 @@ def train_one_config(split_data, config, device, final_mode=False, trial=None):
 
         # Đánh giá trên tập Val để chọn Model tốt nhất
         if not final_mode:
-            val_auc = evaluate(model, val_data, device, target_edge_types, batch_size)
+            val_metrics = evaluate_metrics(model, val_data, device, target_edge_types, batch_size)
+            val_auc = val_metrics["roc_auc"]
             scheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
-            history["val_auc"].append(float(val_auc))
-            log_msg += f" | Val AUC: {val_auc:.4f}| LR: {current_lr :.5f}"
-            if val_auc > best_val_auc:
+            history["val_auc"].append(val_auc)
+            history["val_ap"].append(val_metrics["average_precision"])
+            if val_auc is None:
+                log_msg += f" | Val metrics unavailable | LR: {current_lr:.5f}"
+            else:
+                log_msg += f" | Val AUC: {val_auc:.4f} | Val AP: {val_metrics['average_precision']:.4f} | LR: {current_lr:.5f}"
+            if val_auc is not None and val_auc > best_val_auc:
                 best_val_auc = val_auc
-                best_model_state = model.state_dict()  # Lưu lại state tốt nhất
+                best_model_state = copy.deepcopy(model.state_dict())
                 early_stop_counter = 0
                 call_back(model)
-            else:
-                if val_auc == best_val_auc:
-                    early_stop_counter += 1
+            elif val_auc is not None:
+                early_stop_counter += 1
                 if early_stop_counter >= early_stop_patience:
                     print(
                         f"Early Stopping tại Epoch {epoch} vì Val AUC không giao động trong {early_stop_patience} epochs.")
@@ -489,19 +507,15 @@ def train_one_config(split_data, config, device, final_mode=False, trial=None):
     if not final_mode and best_model_state:
         # Load lại trọng số tốt nhất (đạt đỉnh ở Val) để test
         model.load_state_dict(best_model_state)
-        final_test_auc = evaluate(model, test_data, device, target_edge_types, batch_size)
-        history['test_auc'] = final_test_auc
-        print(f"--> Test AUC: {final_test_auc:.4f}")
+        test_metrics = evaluate_metrics(model, test_data, device, target_edge_types, batch_size)
+        final_test_auc = test_metrics["roc_auc"]
+        history["test_auc"] = test_metrics["roc_auc"]
+        history["test_ap"] = test_metrics["average_precision"]
+        print(f"--> Test AUC: {test_metrics['roc_auc']} | Test AP: {test_metrics['average_precision']}")
 
     with open(TRAINING_HISTORY_PATH, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=4)
-    # Nếu là final mode thì trả về 1.0 (hoặc train auc)
     best_model = model
-    final_test_auc = 1.0
-    best_epoch_found = epochs
-
-    # Trả về Test AUC thay vì Val AUC để Grid Search in ra kết quả thực tế hơn
-    # Hoặc bạn vẫn có thể trả về Val AUC để chọn tham số, nhưng in Test AUC để tham khảo
 
     torch.cuda.empty_cache()  # Xả VRAM
     gc.collect()
@@ -585,7 +599,7 @@ def pre_process_data(data):
     return data
 
 
-def run_optimization(data = None):
+def run_optimization(data=None, val_ratio=0.1, test_ratio=0.1):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running on: {device}")
 
@@ -601,7 +615,7 @@ def run_optimization(data = None):
     # 2. Cắt dữ liệu (In-Place Modification)
     # Hàm này sẽ xóa cạnh Val/Test khỏi `data` và trả về indices rời
     # train_graph chính là biến `data` sau khi bị cắt
-    split_data = prepare_data_splits(data, val_ratio=0.005, test_ratio=0.005)
+    split_data = prepare_data_splits(data, val_ratio=val_ratio, test_ratio=test_ratio)
     config = {
         'hidden_dim': 256,
         'batch_size': 128,

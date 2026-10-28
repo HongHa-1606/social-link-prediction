@@ -209,13 +209,13 @@ PARTNER = """
 STUDENT_OF = """
 { 
   ?person wdt:P1066 ?object. 
-  BIND("mentor_student" AS ?relationshipLabel)
+  BIND("student_of" AS ?relationshipLabel)
 }
 """
 ADVISOR_OF = """
 { 
   ?object wdt:P184 ?person. 
-  BIND("mentor_student" AS ?relationshipLabel)
+  BIND("advisor_of" AS ?relationshipLabel)
 }
 """
 INFLUENCED_BY = """
@@ -253,32 +253,50 @@ INTEREST_GENRE = """
 """
 
 ALL_QUERIES =   {
-        #"spouse": (SPOUSE, PAGE_SIZE),
-        #"father": (FATHER, PAGE_SIZE),
-        #"mother": (MOTHER, PAGE_SIZE),
-        #"sibling": (SIBLING, PAGE_SIZE),
-        "education": (EDUCATION, PAGE_SIZE),
-        # "interest_field": (INTEREST_FIELD, PAGE_SIZE),
-        "interest_sport": (INTEREST_SPORT, PAGE_SIZE),
-        # "interest_instrument": (INTEREST_INSTRUMENT, PAGE_SIZE),
-        # "interest_genre": (INTEREST_GENRE, PAGE_SIZE),
-        # "event": (EVENT_PARTICIPANT, PAGE_SIZE),
-        # "party": (POLITICAL_PARTY, PAGE_SIZE),
-        # "group": (MEMBER_OF_GROUP, PAGE_SIZE),
-        "employer": (EMPLOYER, PAGE_SIZE),
-        # "performer": (PERFORMER, PAGE_SIZE),
-        # "film_actor": (FILM_ACTOR, PAGE_SIZE),
-        # "film_director": (FILM_DIRECTOR, PAGE_SIZE),
-        # "film_screenwriter": (FILM_SCREENWRITER, PAGE_SIZE),
-        # "music_composer": (COMPOSER, PAGE_SIZE),
-        # "music_lyricist": (MUSIC_LYRICIST, PAGE_SIZE),
-        # "author": (AUTHOR, PAGE_SIZE),
-        "award": (AWARD, PAGE_SIZE),
-        # "position": (POSITION_HELD, PAGE_SIZE),
-        # "partner": (PARTNER, PAGE_SIZE),
-        # "student": (STUDENT_OF, PAGE_SIZE),
-        # "advisor": (ADVISOR_OF, PAGE_SIZE),
-        # "influenced": (INFLUENCED_BY, PAGE_SIZE),
-        # "religion": (RELIGION, PAGE_SIZE),
-        # "ideology": (POLITICAL_IDEOLOGY, PAGE_SIZE),
+  "student": (STUDENT_OF, PAGE_SIZE),
+  "advisor": (ADVISOR_OF, PAGE_SIZE),
 }
+
+STUDENT_ADVISOR_UNION_QUERY = """
+SELECT ?person ?personLabel ?personDescription ?birthYear
+       ?birthPlace ?birthPlaceLabel ?country ?countryLabel
+       ?object ?objectLabel ?objectDescription ?relationshipLabel
+WHERE {
+  {
+    {
+      SELECT ?person ?person_dob ?object WHERE {
+        ?person wdt:P31 wd:Q5;
+                wdt:P569 ?person_dob;
+                wdt:P1066 ?object.
+        ##YEAR_FILTER_HOOK##
+      }
+      ORDER BY ?person
+      LIMIT ##PER_RELATION_LIMIT##
+    }
+    BIND("student_of" AS ?relationshipLabel)
+    BIND(YEAR(?person_dob) AS ?birthYear)
+    OPTIONAL { ?person wdt:P19 ?birthPlace. }
+    OPTIONAL { ?person wdt:P27 ?country. }
+    SERVICE wikibase:label { bd:serviceParam wikibase:language "en,vi". }
+  }
+  UNION
+  {
+    {
+      SELECT ?person ?person_dob ?object WHERE {
+        ?person wdt:P31 wd:Q5;
+                wdt:P569 ?person_dob.
+        ?object wdt:P184 ?person.
+        ##YEAR_FILTER_HOOK##
+      }
+      ORDER BY ?person
+      LIMIT ##PER_RELATION_LIMIT##
+    }
+    BIND("advisor_of" AS ?relationshipLabel)
+    BIND(YEAR(?person_dob) AS ?birthYear)
+    OPTIONAL { ?person wdt:P19 ?birthPlace. }
+    OPTIONAL { ?person wdt:P27 ?country. }
+    SERVICE wikibase:label { bd:serviceParam wikibase:language "en,vi". }
+  }
+}
+ORDER BY ?person ?relationshipLabel
+"""

@@ -39,7 +39,7 @@ class WikidataExtractor:
         self.current_json_head = None
 
 
-    def _run_paginated_query(self, base_query: str, page_size=10000) -> list:
+    def _run_paginated_query(self, base_query: str, page_size=1000, max_results=None) -> list:
 
         page = 1
         all_bindings = []
@@ -49,10 +49,14 @@ class WikidataExtractor:
         current_page_size = page_size
 
         while True:
-            paginated_query = base_query + f"\nLIMIT {current_page_size}\nOFFSET {offset_num}"
+            remaining = None if max_results is None else max_results - len(all_bindings)
+            if remaining is not None and remaining <= 0:
+                break
+            request_page_size = current_page_size if remaining is None else min(current_page_size, remaining)
+            paginated_query = base_query + f"\nLIMIT {request_page_size}\nOFFSET {offset_num}"
             self.sparql.setQuery(paginated_query)
 
-            print(f"{datetime.now().strftime('%H:%M:%S')} Đang lấy trang {page}, {current_page_size}/page...", end="",
+            print(f"{datetime.now().strftime('%H:%M:%S')} Đang lấy trang {page}, {request_page_size}/page...", end="",
                   flush=True)
 
             try:
@@ -77,12 +81,16 @@ class WikidataExtractor:
 
                 print(f" OK! Lấy {len(bindings)}, mất {int(duration)}s", end="\n", flush=True)
 
-                if not bindings or len(bindings) < current_page_size:
+                if max_results is not None and len(all_bindings) >= max_results:
+                    print(f"\n-------> Đạt giới hạn {max_results} kết quả")
+                    break
+
+                if not bindings or len(bindings) < request_page_size:
                     print(f"\n-------> Đã lấy hết! Tổng {len(all_bindings)}")
                     break
 
                 page += 1
-                offset_num += current_page_size
+                offset_num += len(bindings)
                 time.sleep(1)
 
             except Exception as e:
@@ -98,8 +106,8 @@ class WikidataExtractor:
                     else:
                         sleep_time = 5 * retry_count
 
-                    if current_page_size > 2000:
-                        current_page_size -= 2000
+                    if current_page_size > 250:
+                        current_page_size = max(250, current_page_size // 2)
 
                     print(
                         f"    Đang thử lại (lần {retry_count}/{max_retries}) sau {sleep_time}s với {current_page_size}/page...",
@@ -119,7 +127,7 @@ class WikidataExtractor:
             current_start = current_end
         return intervals
 
-    def _run_interval_query(self, start, end, base_query, page_size, step = 5 ) -> list:
+    def _run_interval_query(self, start, end, base_query, page_size, step=5, max_results=None) -> list:
         """
         Chạy query theo từng khoảng thời gian (Intervals).
         """
@@ -131,12 +139,20 @@ class WikidataExtractor:
         start_time = datetime.now()
 
         for start_year, end_year in intervals:
+            remaining = None if max_results is None else max_results - len(all_bindings)
+            if remaining is not None and remaining <= 0:
+                print(f"Đã đạt giới hạn {max_results} kết quả cho query này.")
+                break
+
             print(f"\n--- KỶ NGUYÊN {start_year}-{end_year} ---")
 
-            year_filter_str = f"FILTER(YEAR(?person_dob) > {start_year} && YEAR(?person_dob) <= {end_year})"
+            year_filter_str = (
+                f'FILTER(?person_dob >= "{start_year}-01-01T00:00:00Z"^^xsd:dateTime '
+                f'&& ?person_dob < "{end_year}-01-01T00:00:00Z"^^xsd:dateTime)'
+            )
             era_query = base_query.replace("##YEAR_FILTER_HOOK##", year_filter_str)
 
-            binding = self._run_paginated_query(era_query, page_size)
+            binding = self._run_paginated_query(era_query, page_size, max_results=remaining)
             all_bindings.extend(binding)
 
             print(f"--- KẾT THÚC {start_year}-{end_year}. (Tổng tích lũy: {len(all_bindings)}) ---")
@@ -168,19 +184,49 @@ class WikidataExtractor:
         except IOError as e:
             print(f"\n!!! LỖI KHI LƯU FILE: {e}", file=sys.stderr)
 
-    def fetch_all_relationships(self, relationship_queries, start, end, step):
+    def fetch_all_relationships(self, relationship_queries, start, end, step, max_records_per_relation=None):
         os.makedirs(RAW_JSON_DIR, exist_ok=True)
         for name, (snippet, page_size) in relationship_queries.items():
 
             print(f"\n\n################ STARTING JOB: {name} ################")
             full_query = BASE_QUERY.replace("##FIND_HOOK##", snippet) # thêm truy vấn  con
-            all_bindings = self._run_interval_query(start, end, full_query, page_size, step = step) # chạy truy vấn
+            all_bindings = self._run_interval_query(
+                start,
+                end,
+                full_query,
+                page_size,
+                step=step,
+                max_results=max_records_per_relation,
+            )
 
             self._save_data(all_bindings, name)  # lưu kết quả
 
             time.sleep(1)
 
         print("\n*** HOÀN TẤT TẤT CẢ TRUY VẤN! ***")
+
+    def fetch_combined_relationships(
+        self,
+        combined_query,
+        name,
+        start,
+        end,
+        step,
+        page_size=1000,
+        max_results=None,
+    ):
+        """Fetch multiple relation patterns from one SPARQL UNION query."""
+        os.makedirs(RAW_JSON_DIR, exist_ok=True)
+        all_bindings = self._run_interval_query(
+            start,
+            end,
+            combined_query,
+            page_size,
+            step=step,
+            max_results=max_results,
+        )
+        self._save_data(all_bindings, name)
+        return len(all_bindings)
 
 
 if __name__ == "__main__":
