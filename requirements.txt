@@ -10,6 +10,8 @@ torch
 torch-geometric
 sentence-transformers
 scikit-learn
+pyarrow
+optuna
 
 # Utils
 thefuzz

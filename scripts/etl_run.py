@@ -10,7 +10,7 @@ from infrastructure.repositories import PickleGraphRepository
 
 
 def run_etl_pipeline():
-    extractor = WikidataExtractor(user_agent= 'quangminh222@gmail.com')
+    extractor = WikidataExtractor(user_agent= 'hahnnguyen1606@gmail.com')
     success = extractor.fetch_all_relationships()
     if not success:
         print('Failed to fetch data from Wikidata.')

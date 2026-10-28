@@ -13,6 +13,7 @@ import numpy as np
 from tqdm.auto import tqdm
 from sklearn.metrics import roc_auc_score
 from infrastructure.repositories import PyGDataRepository
+from core.ai.gnn_architecture import LinkPredictionModel as ProjectLinkPredictionModel
 from config.settings import  PYG_DATA_PATH, OUTPUT_DIM, TRAINING_HISTORY_PATH, MODEL_PATH, \
     PYG_TRAINING_DATA_PATH
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
@@ -433,9 +434,8 @@ def train_one_config(split_data, config, device, final_mode=False, trial=None):
     lr = config['lr']
     epochs = config['epochs']
     batch_size = config['batch_size']
-    dropout = config['dropout']
     print("Initializing Model!", flush=True, end=" ")
-    model = HGTLinkPrediction(hidden_dim, OUTPUT_DIM, data=train_data, dropout=dropout).to(device)
+    model = ProjectLinkPredictionModel(hidden_dim, OUTPUT_DIM, data=train_data).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     print("Completed!", flush=True)
 
@@ -454,7 +454,7 @@ def train_one_config(split_data, config, device, final_mode=False, trial=None):
     best_model_state = None
     best_epoch_found = 0
 
-    print(f"\nHidden={hidden_dim}, LR={lr}, epochs={epochs}, dropout={dropout}, batch_size={batch_size}")
+    print(f"\nHidden={hidden_dim}, LR={lr}, epochs={epochs}, batch_size={batch_size}")
     scaler = torch.amp.GradScaler('cuda')  # 4. TRAINING LOOP
     for epoch in range(1, epochs + 1):
         loss = train_epoch(model, train_data, optimizer, device, target_edge_types, scaler, batch_size)
@@ -593,8 +593,8 @@ def run_optimization(data = None):
     print("\n>>> Loading & Splitting Data...")
 
     # 1. Load dữ liệu gốc
-    #if data is None:
-    data = get_or_prepare_data()
+    if data is None:
+        data = get_or_prepare_data()
 
 
     run_test(data)
@@ -603,10 +603,9 @@ def run_optimization(data = None):
     # train_graph chính là biến `data` sau khi bị cắt
     split_data = prepare_data_splits(data, val_ratio=0.005, test_ratio=0.005)
     config = {
-        'hidden_dim': 128,
+        'hidden_dim': 256,
         'batch_size': 128,
         'lr': 0.01,
-        'dropout': 0.41372892081262375,
         'epochs': 50
     }
     best_val_auc, test_auc, best_model = train_one_config(split_data, config, device)
